@@ -357,45 +357,85 @@ class BedrockToolAgent:
         input_data = tool_use.get("input", {}) or {}
         tid = tool_use["toolUseId"]
 
+        logger.info("Executing tool via BedrockToolAgent: %s", name)
+        logger.debug("Tool input: %s", _pretty_json(input_data))
+
         try:
+            # ---- Run the actual Python tool ----
             if name == "list_edges":
-                result = self.vco_client.list_edges()
+                raw_result = self.vco_client.list_edges()
 
             elif name == "get_edge_health":
                 lid = input_data.get("logical_id")
                 minutes = int(input_data.get("minutes", 15))
                 if not lid:
                     raise ValueError("Missing logical_id")
-                result = self.vco_client.get_edge_health(lid, minutes)
+                raw_result = self.vco_client.get_edge_health(lid, minutes)
 
-            elif name == "get_enterprise_health":
-                minutes = int(input_data.get("minutes", 15))
-                result = self.vco_client.get_enterprise_health(minutes)
+            elif name == "Test_Simple_Tool":
+                raw_result = "Simple tool sanity test successful!"
 
             else:
                 raise ValueError(f"Unknown tool: {name}")
 
+            # ---- Normalize result to a dict for json ----
+            if isinstance(raw_result, BaseModel):
+                payload = raw_result.model_dump()
+            elif isinstance(raw_result, dict):
+                payload = raw_result
+            elif isinstance(raw_result, list):
+                normalized_items = []
+                for item in raw_result:
+                    if isinstance(item, BaseModel):
+                        normalized_items.append(item.model_dump())
+                    else:
+                        normalized_items.append(item)
+                payload = {"items": normalized_items}
+            else:
+                # e.g. string, int, float, etc.
+                payload = {"result": raw_result}
+
+            logger.debug("Tool %s normalized payload: %s", name, _pretty_json(payload))
+
             return {
                 "role": "tool",
-                "content": [{
-                    "toolResult": {
-                        "toolUseId": tid,
-                        "content": [{"json": result}],
+                "content": [
+                    {
+                        "toolResult": {
+                            "toolUseId": tid,
+                            "content": [
+                                {
+                                    "json": payload,
+                                }
+                            ],
+                        }
                     }
-                }],
+                ],
             }
 
         except Exception as e:
             logger.exception("Tool execution failed")
+            error_payload = {
+                "error": str(e),
+                "tool": name,
+                "input": input_data,
+            }
+            # error is also a dict, so safe to send as json
             return {
                 "role": "tool",
-                "content": [{
-                    "toolResult": {
-                        "toolUseId": tid,
-                        "status": "error",
-                        "content": [{"json": {"error": str(e)}}],
+                "content": [
+                    {
+                        "toolResult": {
+                            "toolUseId": tid,
+                            "status": "error",
+                            "content": [
+                                {
+                                    "json": error_payload,
+                                }
+                            ],
+                        }
                     }
-                }],
+                ],
             }
 
 
