@@ -321,6 +321,36 @@ class BedrockToolAgent:
                 messages.append(self._execute_tool(t))
 
         raise RuntimeError("Exceeded max tool-calling iterations")
+      
+    def _result_to_content_blocks(self, result: Any) -> List[Dict[str, Any]]:
+        """
+        Convert a Python tool result into Converse content blocks for toolResult.
+
+        - Strings -> text blocks
+        - Pydantic models -> dict via .model_dump()
+        - Lists of models -> list of dicts
+        - Dict/List -> json block
+        """
+        # If it's a simple string, send as text
+        if isinstance(result, str):
+            return [{"text": result}]
+
+        # If it's a Pydantic model, dump to dict
+        if isinstance(result, BaseModel):
+            result = result.model_dump()
+
+        # If it's a list of Pydantic models, dump each
+        if isinstance(result, list):
+            normalized = []
+            for item in result:
+                if isinstance(item, BaseModel):
+                    normalized.append(item.model_dump())
+                else:
+                    normalized.append(item)
+            result = normalized
+
+        # For dicts/lists (or other JSON-native types), send as json
+        return [{"json": result}]
 
     def _execute_tool(self, tool_use: Dict[str, Any]) -> Dict[str, Any]:
         name = tool_use["name"]
