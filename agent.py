@@ -170,89 +170,98 @@ class BedrockToolAgent:
         logger.error("Exceeded max tool-calling iterations without a final answer.")
         raise RuntimeError("Exceeded max tool-calling iterations without a final answer.")
         
-    def _execute_tool(self, tool_use: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Execute a single toolUse block and return a toolResult message.
-        Shape is aligned with AWS docs:
+def _execute_tool(self, tool_use: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Execute a toolUse and return a toolResult message.
+    """
+    name = tool_use["name"]
+    input_data = tool_use.get("input", {}) or {}
+    tid = tool_use["toolUseId"]
 
+    logger.info("Executing tool via BedrockToolAgent: %s", name)
+    logger.debug("Tool input: %s", _pretty_json(input_data))
+
+    try:
+        # ---- Run the actual Python tool & build a SHORT TEXT summary ----
+        if name == "list_edges":
+            edges = self.vco_client.list_edges()
+            # Build a compact text summary (no huge JSON)
+            parts = []
+            for e in edges[:10]:  # cap at first 10 to stay small
+                # Adjust attributes to match your VeloEdge model
+                parts.append(
+                    f"{e.name} (logical_id={e.logical_id}, status={e.status})"
+                )
+            summary_text = (
+                f"Found {len(edges)} edges. "
+                f"First {len(parts)}: " + "; ".join(parts)
+            )
+
+        elif name == "get_edge_health":
+            lid = input_data.get("logical_id")
+            minutes = int(input_data.get("minutes", 15))
+            if not lid:
+                raise ValueError("Missing logical_id")
+
+            h = self.vco_client.get_edge_health(
+                logical_id=lid,
+                minutes=minutes,
+            )
+            # Adjust attribute names to match your VeloEdgeHealth model
+            summary_text = (
+                f"Edge {lid} health over last {minutes} minutes: "
+                f"cpu_avg={h.cpu_pct.average}%, "
+                f"mem_avg={h.memory_pct.average}%, "
+                f"flows_avg={h.flow_count.average}, "
+                f"drops_avg={h.handoff_queue_drops.average}"
+            )
+
+        elif name == "Test_Simple_Tool":
+            summary_text = "Simple tool sanity test successful!"
+
+        else:
+            raise ValueError(f"Unknown tool: {name}")
+
+        logger.debug("Tool %s summary_text: %s", name, summary_text)
+
+        # NOTE: We use TEXT here, not JSON.
         tool_result = {
-            "toolUseId": ...,
-            "content": [ { "json": {...} } ]  # or { "text": ... } in some cases
+            "toolUseId": tid,
+            "content": [
+                {
+                    "text": summary_text,
+                }
+            ],
         }
-        tool_result_message = {
+
+        # Per AWS example: role is "user" for toolResult messages.
+        return {
             "role": "user",
-            "content": [ { "toolResult": tool_result } ]
+            "content": [
+                {
+                    "toolResult": tool_result,
+                }
+            ],
         }
-        """
-        name = tool_use["name"]
-        input_data = tool_use.get("input", {}) or {}
-        tid = tool_use["toolUseId"]
 
-        logger.info("Executing tool via BedrockToolAgent: %s", name)
-        logger.debug("Tool input: %s", _pretty_json(input_data))
-
-        try:
-            # ---- Call the actual Python-side tool ----
-            if name == "list_edges":
-                raw_result = self.vco_client.list_edges()
-
-            elif name == "get_edge_health":
-                lid = input_data.get("logical_id")
-                minutes = int(input_data.get("minutes", 15))
-                if not lid:
-                    raise ValueError("Missing logical_id")
-                raw_result = self.vco_client.get_edge_health(lid, minutes)
-
-            elif name == "Test_Simple_Tool":
-                raw_result = "Simple tool sanity test successful!"
-
-            else:
-                raise ValueError(f"Unknown tool: {name}")
-
-            payload = self._normalize_result_to_dict(raw_result)
-            logger.debug("Tool %s normalized payload: %s", name, _pretty_json(payload))
-
-            tool_result = {
-                "toolUseId": tid,
-                "content": [
-                    {
-                        "json": payload,
-                    }
-                ],
-            }
-
-            # NOTE: role is "user", matching AWS example.
-            return {
-                "role": "user",
-                "content": [
-                    {
-                        "toolResult": tool_result,
-                    }
-                ],
-            }
-
-        except Exception as e:
-            logger.exception("Tool execution failed for %s", name)
-            error_payload = {
-                "error": str(e),
-                "tool": name,
-                "input": input_data,
-            }
-            tool_result = {
-                "toolUseId": tid,
-                "content": [
-                    {
-                        "json": error_payload,
-                    }
-                ],
-                "status": "error",
-            }
-            return {
-                "role": "user",
-                "content": [
-                    {
-                        "toolResult": tool_result,
-                    }
-                ],
-            }
+    except Exception as e:
+        logger.exception("Tool execution failed for %s", name)
+        error_text = f"Error executing tool {name}: {e}"
+        tool_result = {
+            "toolUseId": tid,
+            "content": [
+                {
+                    "text": error_text,
+                }
+            ],
+            "status": "error",
+        }
+        return {
+            "role": "user",
+            "content": [
+                {
+                    "toolResult": tool_result,
+                }
+            ],
+        }
 
