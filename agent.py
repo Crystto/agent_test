@@ -94,12 +94,20 @@ class BedrockToolAgent:
 
     def chat(self, question: str) -> str:
         """
-        Single-turn chat using Converse + tools, matching the AWS example shape.
+        Single-turn chat using Converse + tools.
+
+        We intentionally keep the message history minimal:
+
+        - original user question
+        - the latest assistant toolUse message
+        - the matching user toolResult message(s)
+
+        This avoids confusing the LASSO normalizer with multiple
+        historical toolUse/toolResult pairs in a single request.
         """
-        # As in AWS example, we start with just a user message, no system= param.
-        messages: List[Dict[str, Any]] = [
-            {"role": "user", "content": [{"text": question}]}
-        ]
+        # Start with just the user question
+        original_user_message = {"role": "user", "content": [{"text": question}]}
+        messages: List[Dict[str, Any]] = [original_user_message]
 
         logger.info("BedrockToolAgent.chat called. question=%s", question)
         logger.debug(
@@ -122,13 +130,13 @@ class BedrockToolAgent:
 
             logger.debug("Converse stopReason=%s", stop_reason)
 
-            # Extract any requested tool uses
+            # Which tools (if any) does the model want to use?
             tool_uses = [
                 block["toolUse"] for block in content_blocks if "toolUse" in block
             ]
             logger.debug("Found %d toolUse blocks.", len(tool_uses))
 
-            # No tools requested => final answer
+            # No tools requested -> final answer
             if not tool_uses:
                 text = "\n".join(
                     block["text"] for block in content_blocks if "text" in block
@@ -137,17 +145,31 @@ class BedrockToolAgent:
                 logger.debug("Final answer text: %s", text)
                 return text
 
-            # Append model's toolUse message (role: assistant)
-            messages.append(output_message)
-
-            # For each toolUse, execute tool and add toolResult message
+            # For each toolUse we execute the tool and build a toolResult message
+            tool_result_messages: List[Dict[str, Any]] = []
             for tool_use in tool_uses:
                 tool_result_message = self._execute_tool(tool_use)
-                messages.append(tool_result_message)
+                tool_result_messages.append(tool_result_message)
+
+            # 🔑 HERE IS THE IMPORTANT CHANGE:
+            #
+            # Instead of appending to the existing list (which accumulates
+            # multiple toolUse/toolResult pairs), we rebuild `messages`
+            # with just:
+            #   - original user question
+            #   - the latest assistant toolUse message
+            #   - the toolResult message(s) for this iteration
+            new_messages: List[Dict[str, Any]] = [original_user_message, output_message]
+            new_messages.extend(tool_result_messages)
+            messages = new_messages
+
+            logger.debug(
+                "Next-iteration messages count=%d", len(messages)
+            )
 
         logger.error("Exceeded max tool-calling iterations without a final answer.")
         raise RuntimeError("Exceeded max tool-calling iterations without a final answer.")
-
+        
     def _execute_tool(self, tool_use: Dict[str, Any]) -> Dict[str, Any]:
         """
         Execute a single toolUse block and return a toolResult message.
