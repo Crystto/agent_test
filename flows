@@ -1,0 +1,55 @@
+        # NEW: link stats
+        {
+            "toolSpec": {
+                "name": "get_link_stats",
+                "description": (
+                    "Get WAN/link statistics for a specific SD-WAN edge over "
+                    "a lookback window in minutes."
+                ),
+                "inputSchema": {
+                    "json": {
+                        "type": "object",
+                        "properties": {
+                            "logical_id": {
+                                "type": "string",
+                                "description": "The edge logicalId.",
+                            },
+                            "minutes": {
+                                "type": "integer",
+                                "description": "Lookback window in minutes.",
+                                "default": 15,
+                            },
+                        },
+                        "required": ["logical_id"],
+                    }
+                },
+            }
+        },
+        # NEW: flow stats
+        {
+            "toolSpec": {
+                "name": "get_flow_stats",
+                "description": (
+                    "Get flow/traffic statistics for a specific SD-WAN edge "
+                    "over a lookback window in minutes."
+                ),
+                "inputSchema": {
+                    "json": {
+                        "type": "object",
+                        "properties": {
+                            "logical_id": {
+                                "type": "string",
+                                "description": "The edge logicalId.",
+                            },
+                            "minutes": {
+                                "type": "integer",
+                                "description": "Lookback window in minutes.",
+                                "default": 15,
+                            },
+                        },
+                        "required": ["logical_id"],
+                    }
+                },
+            }
+        },
+    ]
