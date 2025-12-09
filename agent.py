@@ -195,24 +195,42 @@ class BedrockToolAgent:
         """
         Normalize any tool result into a JSON-safe value that can go into `json`.
 
+        Requirements (from Bedrock/LASSO behavior):
+        - Top-level must be a JSON object, not an array.
         - Pydantic models (including RootModel) -> model_dump(mode="json")
-        - Lists of models -> list of JSON-safe values
-        - Dicts / lists / primitives -> returned as-is
+        - Lists of models -> {"items": [...]}
+        - Lists in general -> {"items": [...]}
+        - Simple primitives -> {"value": primitive}
         """
+
         # Pydantic models (BaseModel + RootModel subclasses)
         if isinstance(raw_result, BaseModel):
-            return raw_result.model_dump(mode="json")
+            dumped = raw_result.model_dump(mode="json")
+            # If the model dumps to a list (e.g. RootModel[List[...]]) wrap it
+            if isinstance(dumped, list):
+                return {"items": dumped}
+            return dumped
 
-        # Dict/list are already JSON-like
-        if isinstance(raw_result, (dict, list, str, int, float, bool)) or raw_result is None:
+        # Plain dicts are already JSON objects and safe
+        if isinstance(raw_result, dict):
             return raw_result
 
-        # Lists of models or other values
-        if isinstance(raw_result, tuple):
-            return list(raw_result)
+        # Lists / tuples -> wrap in {"items": [...]}
+        if isinstance(raw_result, (list, tuple)):
+            items: List[Any] = []
+            for item in raw_result:
+                if isinstance(item, BaseModel):
+                    items.append(item.model_dump(mode="json"))
+                else:
+                    items.append(item)
+            return {"items": items}
 
-        # Fallback: wrap in a dict
-        return {"result": raw_result}
+        # Simple primitives -> wrap in {"value": ...}
+        if isinstance(raw_result, (str, int, float, bool)) or raw_result is None:
+            return {"value": raw_result}
+
+        # Fallback: stringify unknown types
+        return {"result": str(raw_result)}
 
     # ------------------------------------------------------------------
     # Main chat loop using Converse + tools
