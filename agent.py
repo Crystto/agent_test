@@ -2,10 +2,12 @@ class BedrockToolAgent:
     """
     Native Bedrock tool-calling using Converse.
 
-    Important design choices for working with LASSO:
-    - toolResult payloads are sent as SHORT TEXT summaries, not large JSON.
-    - message history is kept minimal per iteration to avoid confusing the
-      LASSO normalizer and jailbreak heuristics.
+    Version B:
+    - toolResult payloads are sent as JSON (`content: [{"json": ...}]`).
+    - We normalize Pydantic models / lists into JSON-safe objects via
+      `_normalize_result_to_json`.
+    - We keep the message history minimal per iteration:
+        [original_user, latest toolUse, latest toolResult(s)].
     """
 
     def __init__(self, vco_client: VcoClient):
@@ -159,6 +161,24 @@ class BedrockToolAgent:
                                     "maximum": 1440,
                                     "default": 60,
                                 },
+                                "group_by": {
+                                    "type": "string",
+                                    "description": (
+                                        "How to group flows: link, application, clientDevice, "
+                                        "applicationClass, destFQDN, destIp, destPort, destDomain."
+                                    ),
+                                    "enum": [
+                                        "link",
+                                        "application",
+                                        "clientDevice",
+                                        "applicationClass",
+                                        "destFQDN",
+                                        "destIp",
+                                        "destPort",
+                                        "destDomain",
+                                    ],
+                                    "default": "application",
+                                },
                             },
                             "required": ["edge_name"],
                         }
@@ -166,6 +186,33 @@ class BedrockToolAgent:
                 }
             },
         ]
+
+    # ------------------------------------------------------------------
+    # Normalization: convert tool results into JSON-safe values
+    # ------------------------------------------------------------------
+
+    def _normalize_result_to_json(self, raw_result: Any) -> Any:
+        """
+        Normalize any tool result into a JSON-safe value that can go into `json`.
+
+        - Pydantic models (including RootModel) -> model_dump(mode="json")
+        - Lists of models -> list of JSON-safe values
+        - Dicts / lists / primitives -> returned as-is
+        """
+        # Pydantic models (BaseModel + RootModel subclasses)
+        if isinstance(raw_result, BaseModel):
+            return raw_result.model_dump(mode="json")
+
+        # Dict/list are already JSON-like
+        if isinstance(raw_result, (dict, list, str, int, float, bool)) or raw_result is None:
+            return raw_result
+
+        # Lists of models or other values
+        if isinstance(raw_result, tuple):
+            return list(raw_result)
+
+        # Fallback: wrap in a dict
+        return {"result": raw_result}
 
     # ------------------------------------------------------------------
     # Main chat loop using Converse + tools
@@ -180,9 +227,6 @@ class BedrockToolAgent:
         - original user question
         - latest assistant toolUse message
         - matching user toolResult message(s)
-
-        This reduces the chance of LASSO jailbreak / normalization errors
-        when chaining multiple tool calls.
         """
         original_user_message: Dict[str, Any] = {
             "role": "user",
@@ -203,6 +247,7 @@ class BedrockToolAgent:
                 modelId=self.model_id,
                 messages=messages,
                 toolConfig={"tools": self._tool_specs()},
+                system=[{"text": self.system_prompt}],
             )
 
             output_message = response["output"]["message"]
@@ -245,26 +290,14 @@ class BedrockToolAgent:
         raise RuntimeError("Exceeded max tool-calling iterations without a final answer.")
 
     # ------------------------------------------------------------------
-    # Tool execution: run Python code and return SHORT TEXT to Bedrock
+    # Tool execution: call Python functions and return JSON toolResult
     # ------------------------------------------------------------------
 
     def _execute_tool(self, tool_use: Dict[str, Any]) -> Dict[str, Any]:
         """
         Execute a toolUse and return a toolResult message.
 
-        IMPORTANT:
-        - We send results as SHORT TEXT, not JSON, to avoid LASSO jailbreak
-          false positives and normalization issues.
-        - Shape is aligned with AWS docs:
-
-            tool_result = {
-                "toolUseId": ...,
-                "content": [ { "text": "..." } ]
-            }
-            tool_result_message = {
-                "role": "user",
-                "content": [ { "toolResult": tool_result } ]
-            }
+        Version B: results are returned as JSON in toolResult.content[].json.
         """
         name = tool_use["name"]
         input_data = tool_use.get("input", {}) or {}
@@ -274,18 +307,9 @@ class BedrockToolAgent:
         logger.debug("Tool input: %s", _pretty_json(input_data))
 
         try:
-            # ---- Run the actual Python-side tool & build a SHORT TEXT summary ----
+            # ---- Call the actual Python-side tool ----
             if name == "list_edges":
-                edges = self.vco_client.list_edges()
-                parts: List[str] = []
-                for e in edges[:10]:  # only summarize first 10 edges
-                    parts.append(
-                        f"{e.name} (logical_id={e.logical_id}, status={e.status})"
-                    )
-                summary_text = (
-                    f"Found {len(edges)} edges. "
-                    f"First {len(parts)}: " + "; ".join(parts)
-                )
+                raw_result = self.vco_client.list_edges()
 
             elif name == "get_edge_health":
                 lid = input_data.get("logical_id")
@@ -293,22 +317,14 @@ class BedrockToolAgent:
                 if not lid:
                     raise ValueError("Missing logical_id")
 
-                h: VeloEdgeHealth = self.vco_client.get_edge_health(
+                raw_result = self.vco_client.get_edge_health(
                     logical_id=lid,
                     minutes=minutes,
                 )
-                summary_text = (
-                    f"Edge {lid} health over last {minutes} minutes: "
-                    f"cpu_avg={h.cpu_pct.average}%, "
-                    f"mem_avg={h.memory_pct.average}%, "
-                    f"flows_avg={h.flow_count.average}, "
-                    f"drops_avg={h.handoff_queue_drops.average}"
-                )
 
             elif name == "Test_Simple_Tool":
-                summary_text = "Simple tool sanity test successful!"
+                raw_result = "Simple tool sanity test successful!"
 
-            # ---------- NEW: WAN link stats ----------
             elif name == "get_wan_link_stats_for_edge":
                 edge_name = input_data.get("edge_name")
                 if not edge_name:
@@ -316,61 +332,36 @@ class BedrockToolAgent:
                 minutes = int(input_data.get("minutes", 60))
 
                 edge = self._get_edge_by_name_or_raise(edge_name)
-                stats = self.vco_client.get_edge_link_stats(
+                raw_result = self.vco_client.get_edge_link_stats(
                     logical_id=edge.logical_id,
                     minutes=minutes,
                 )
 
-                # stats may be a Pydantic model with `.data`, or a raw dict
-                data = getattr(stats, "data", stats)
-                if isinstance(data, dict) and "data" in data:
-                    data = data["data"]
-
-                num_records = len(data) if isinstance(data, list) else 0
-
-                summary_text = (
-                    f"Retrieved WAN link statistics for edge '{edge.name}' "
-                    f"(logical_id={edge.logical_id}) over the last {minutes} minutes. "
-                    f"Record count: {num_records}. "
-                    "Use this to understand WAN interface status and utilization."
-                )
-
-            # ---------- NEW: WAN flow stats ----------
             elif name == "get_wan_flow_stats_for_edge":
                 edge_name = input_data.get("edge_name")
                 if not edge_name:
                     raise ValueError("Missing edge_name")
                 minutes = int(input_data.get("minutes", 60))
+                group_by = input_data.get("group_by", "application")
 
                 edge = self._get_edge_by_name_or_raise(edge_name)
-                stats = self.vco_client.get_edge_flow_stats(
+                raw_result = self.vco_client.get_edge_flow_stats(
                     logical_id=edge.logical_id,
                     minutes=minutes,
-                )
-
-                data = getattr(stats, "data", stats)
-                if isinstance(data, dict) and "data" in data:
-                    data = data["data"]
-
-                num_records = len(data) if isinstance(data, list) else 0
-
-                summary_text = (
-                    f"Retrieved WAN flow statistics for edge '{edge.name}' "
-                    f"(logical_id={edge.logical_id}) over the last {minutes} minutes. "
-                    f"Record count: {num_records}. "
-                    "Use this to understand traffic mix, top talkers, and application usage."
+                    group_by=group_by,
                 )
 
             else:
                 raise ValueError(f"Unknown tool: {name}")
 
-            logger.debug("Tool %s summary_text: %s", name, summary_text)
+            payload = self._normalize_result_to_json(raw_result)
+            logger.debug("Tool %s normalized payload: %s", name, _pretty_json(payload))
 
             tool_result = {
                 "toolUseId": tid,
                 "content": [
                     {
-                        "text": summary_text,
+                        "json": payload,
                     }
                 ],
             }
@@ -387,12 +378,16 @@ class BedrockToolAgent:
 
         except Exception as e:
             logger.exception("Tool execution failed for %s", name)
-            error_text = f"Error executing tool {name}: {e}"
+            error_payload = {
+                "error": str(e),
+                "tool": name,
+                "input": input_data,
+            }
             tool_result = {
                 "toolUseId": tid,
                 "content": [
                     {
-                        "text": error_text,
+                        "json": error_payload,
                     }
                 ],
                 "status": "error",
